@@ -1,0 +1,120 @@
+name: Project checks
+
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, edited, synchronize, reopened, ready_for_review]
+  pull_request_review:
+    types: [submitted, edited, dismissed]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    name: project-tests
+    if: github.event_name != 'pull_request_review' || github.event.pull_request.base.ref == 'main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Установка зависимостей
+        shell: bash
+        run: |
+          if [ -f poetry.lock ]; then
+            python -m pip install 'poetry>=2,<3'
+            poetry install --no-interaction
+            echo 'TEST_RUNNER=poetry run python' >> "$GITHUB_ENV"
+          elif [ -f uv.lock ]; then
+            python -m pip install uv
+            uv sync --locked
+            echo 'TEST_RUNNER=uv run --no-sync python' >> "$GITHUB_ENV"
+          else
+            python -m pip install 'pytest>=8,<10'
+            if [ -f requirements.txt ]; then
+              python -m pip install -r requirements.txt
+            elif [ -f pyproject.toml ]; then
+              python -m pip install -e .
+            fi
+            echo 'TEST_RUNNER=python' >> "$GITHUB_ENV"
+          fi
+      - name: Запуск тестов
+        shell: bash
+        run: |
+          read -r -a runner <<< "$TEST_RUNNER"
+          test_status=0
+          "${runner[@]}" -m pytest || test_status=$?
+          if [ "$test_status" -eq 5 ]; then
+            echo 'Тесты не найдены' >> "$GITHUB_STEP_SUMMARY"
+            exit 5
+          fi
+          exit "$test_status"
+
+  content:
+    if: github.event.pull_request.base.ref == 'main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      pull-requests: read
+      statuses: write
+    concurrency:
+      group: pr-content-${{ github.event.pull_request.number }}
+      cancel-in-progress: true
+    steps:
+      - uses: actions/github-script@v8
+        with:
+          script: |
+            const repository = context.repo;
+            const pull_number = context.payload.pull_request.number;
+            const {data: pr} = await github.rest.pulls.get({...repository, pull_number});
+            if (pr.state !== 'open' || pr.base.ref !== 'main') return;
+
+            const status = {...repository, sha: pr.head.sha, context: 'pr-content'};
+            await github.rest.repos.createCommitStatus({
+              ...status, state: 'pending', description: 'Проверка описания PR и итога ревью',
+            });
+
+            const errors = [];
+            const description = (pr.body ?? '').replace(/<!--[\s\S]*?-->/g, '').trim();
+            if (!description) errors.push('Заполните описание PR');
+
+            const reviews = await github.paginate(github.rest.pulls.listReviews, {
+              ...repository, pull_number, per_page: 100,
+            });
+            const decisions = new Map();
+            for (const review of reviews) {
+              if (review.user && ['APPROVED', 'CHANGES_REQUESTED', 'DISMISSED'].includes(review.state)) {
+                decisions.set(review.user.login, review);
+              }
+            }
+
+            let approvedWithSummary = false;
+            for (const [username, review] of decisions) {
+              if (username === pr.user.login || review.state !== 'APPROVED' ||
+                  review.commit_id !== pr.head.sha || !review.body?.trim()) continue;
+              const {data: access} = await github.rest.repos.getCollaboratorPermissionLevel({
+                ...repository, username,
+              });
+              if (['write', 'admin'].includes(access.permission)) {
+                approvedWithSummary = true;
+                break;
+              }
+            }
+            if (!approvedWithSummary) {
+              errors.push('Нужен Approve с непустым итогом от другого участника с правом записи');
+            }
+
+            await github.rest.repos.createCommitStatus({
+              ...status,
+              state: errors.length ? 'failure' : 'success',
+              description: errors.length ? 'Заполните описание PR и итог одобряющего ревью' : 'Описание PR и итог ревью заполнены',
+            });
+            if (errors.length) core.setFailed(errors.join('\n'));
